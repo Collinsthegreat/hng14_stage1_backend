@@ -77,6 +77,7 @@ func NewRouter() http.Handler {
 	r.Use(middleware.CORS)
 	r.Use(middleware.Logger)
 	r.Use(chiMiddleware.Recoverer)
+	r.Use(chiMiddleware.StripSlashes)
 
 	// Custom 404
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
@@ -87,12 +88,10 @@ func NewRouter() http.Handler {
 	})
 
 	// Routes
-	r.Route("/api/profiles", func(r chi.Router) {
-		r.Post("/", hdl.Create)
-		r.Get("/", hdl.List)
-		r.Get("/{id}", hdl.Get)
-		r.Delete("/{id}", hdl.Delete)
-	})
+	r.Post("/api/profiles", hdl.Create)
+	r.Get("/api/profiles", hdl.List)
+	r.Get("/api/profiles/{id}", hdl.Get)
+	r.Delete("/api/profiles/{id}", hdl.Delete)
 
 	return r
 }
