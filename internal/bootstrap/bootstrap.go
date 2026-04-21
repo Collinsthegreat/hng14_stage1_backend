@@ -12,6 +12,7 @@ import (
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/username/repo-name/db/migrations"
+	"github.com/username/repo-name/db/seed"
 	"github.com/username/repo-name/internal/client"
 	"github.com/username/repo-name/internal/handler"
 	"github.com/username/repo-name/internal/middleware"
@@ -21,7 +22,7 @@ import (
 )
 
 func NewRouter() http.Handler {
-	// Setup Database Pool
+	// Startup Sequence Step 1: Connect to DB pool
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL is required")
@@ -33,12 +34,29 @@ func NewRouter() http.Handler {
 		log.Fatalf("Unable to connect to database: %v", err)
 	}
 
-	// Auto-run migrations using embedded SQL
+	log.Println("Step 1: DB Pool connected")
+
+	// Startup Sequence Step 2: Run migration 001
 	if migrations.CreateProfilesSQL != "" {
 		if _, err := pool.Exec(ctx, migrations.CreateProfilesSQL); err != nil {
-			log.Fatalf("Failed to run migrations: %v", err)
+			log.Fatalf("Failed to run migration 001: %v", err)
 		}
 	}
+	log.Println("Step 2: Migration 001 completed")
+
+	// Startup Sequence Step 3: Run migration 002
+	if migrations.AddCountryNameSQL != "" {
+		if _, err := pool.Exec(ctx, migrations.AddCountryNameSQL); err != nil {
+			log.Fatalf("Failed to run migration 002: %v", err)
+		}
+	}
+	log.Println("Step 3: Migration 002 completed")
+
+	// Startup Sequence Step 4: Run Seeding
+	if err := seed.SeedProfiles(ctx, pool); err != nil {
+		log.Fatalf("Failed to run seed profiles: %v", err)
+	}
+	log.Println("Step 4: SeedProfiles completed")
 
 	// Setup external clients
 	timeoutStr := os.Getenv("HTTP_TIMEOUT_SECONDS")
@@ -67,8 +85,10 @@ func NewRouter() http.Handler {
 
 	// Setup Layers
 	repo := repository.NewProfileRepository(pool)
+	// Create NLP parser service
+	parserSvc := service.NewParserService()
 	svc := service.NewProfileService(repo, genderizeClient, agifyClient, natClient)
-	hdl := handler.NewProfileHandler(svc)
+	hdl := handler.NewProfileHandler(svc, parserSvc)
 
 	// Setup Router
 	r := chi.NewRouter()
@@ -88,10 +108,13 @@ func NewRouter() http.Handler {
 	})
 
 	// Routes
+	// ORDER-SENSITIVE: /search MUST be registered before /{id}
+	r.Get("/api/profiles/search", hdl.Search)
 	r.Post("/api/profiles", hdl.Create)
 	r.Get("/api/profiles", hdl.List)
 	r.Get("/api/profiles/{id}", hdl.Get)
 	r.Delete("/api/profiles/{id}", hdl.Delete)
 
+	log.Println("Step 5: HTTP Server / Router initialized")
 	return r
 }

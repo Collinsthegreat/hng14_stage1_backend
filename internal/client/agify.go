@@ -41,7 +41,7 @@ func (c *agifyClient) Fetch(ctx context.Context, name string) (AgifyResponse, er
 	start := time.Now()
 	resp, err := c.client.Do(req)
 	duration := time.Since(start)
-	
+
 	outcome := "success"
 	if err != nil {
 		outcome = "failure"

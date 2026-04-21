@@ -45,7 +45,7 @@ func (c *nationalizeClient) Fetch(ctx context.Context, name string) (Nationalize
 	start := time.Now()
 	resp, err := c.client.Do(req)
 	duration := time.Since(start)
-	
+
 	outcome := "success"
 	if err != nil {
 		outcome = "failure"

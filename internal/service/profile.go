@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/sync/errgroup"
 	"github.com/username/repo-name/internal/client"
 	"github.com/username/repo-name/internal/model"
 	"github.com/username/repo-name/internal/repository"
+	"golang.org/x/sync/errgroup"
 )
 
 type ValidationErr struct {
@@ -28,14 +28,14 @@ func IsValidationErr(err error) bool {
 type ProfileService interface {
 	CreateProfile(ctx context.Context, req model.CreateProfileRequest) (*model.Profile, bool, error)
 	GetProfile(ctx context.Context, id string) (*model.Profile, error)
-	ListProfiles(ctx context.Context, gender, countryID, ageGroup string) ([]model.ProfileListItem, error)
+	ListProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, int, error)
 	DeleteProfile(ctx context.Context, id string) error
 }
 
 type profileService struct {
-	repo       repository.ProfileRepository
-	genderize  client.GenderizeClient
-	agify      client.AgifyClient
+	repo        repository.ProfileRepository
+	genderize   client.GenderizeClient
+	agify       client.AgifyClient
 	nationalize client.NationalizeClient
 }
 
@@ -114,6 +114,7 @@ func (s *profileService) CreateProfile(ctx context.Context, req model.CreateProf
 		Age:                *agifyRes.Age,
 		AgeGroup:           classifyAgeGroup(*agifyRes.Age),
 		CountryID:          bestCountry.CountryID,
+		CountryName:        "Unknown", // A simple default for new Stage1 API posts since Nationalize only returns ID
 		CountryProbability: bestCountry.Probability,
 		CreatedAt:          time.Now().UTC(),
 	}
@@ -129,8 +130,8 @@ func (s *profileService) GetProfile(ctx context.Context, id string) (*model.Prof
 	return s.repo.GetByID(ctx, id)
 }
 
-func (s *profileService) ListProfiles(ctx context.Context, gender, countryID, ageGroup string) ([]model.ProfileListItem, error) {
-	return s.repo.List(ctx, gender, countryID, ageGroup)
+func (s *profileService) ListProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, int, error) {
+	return s.repo.List(ctx, f)
 }
 
 func (s *profileService) DeleteProfile(ctx context.Context, id string) error {

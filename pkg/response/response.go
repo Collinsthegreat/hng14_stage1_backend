@@ -22,6 +22,14 @@ type ListResponse struct {
 	Data   any    `json:"data"`
 }
 
+type PaginatedResponse struct {
+	Status string `json:"status"`
+	Page   int    `json:"page"`
+	Limit  int    `json:"limit"`
+	Total  int    `json:"total"`
+	Data   any    `json:"data"`
+}
+
 func JSON(w http.ResponseWriter, statusCode int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
@@ -47,6 +55,16 @@ func List(w http.ResponseWriter, count int, data any) {
 	JSON(w, http.StatusOK, ListResponse{
 		Status: "success",
 		Count:  count,
+		Data:   data,
+	})
+}
+
+func PaginatedList(w http.ResponseWriter, page, limit, total int, data any) {
+	JSON(w, http.StatusOK, PaginatedResponse{
+		Status: "success",
+		Page:   page,
+		Limit:  limit,
+		Total:  total,
 		Data:   data,
 	})
 }
