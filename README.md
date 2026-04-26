@@ -69,7 +69,7 @@ go run ./cmd/server
 ### DELETE /api/profiles/{id}
 
 ## Live URL
-https://yourapp.vercel.app
+https://hng14-stage1-backend.vercel.app
 
 ## Natural Language Search — How It Works
 
