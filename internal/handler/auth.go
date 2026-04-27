@@ -28,6 +28,9 @@ func (h *AuthHandler) RedirectToGitHub(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	codeChallenge := q.Get("code_challenge")
 	codeChallengeMethod := q.Get("code_challenge_method")
+	if codeChallenge != "" && codeChallengeMethod == "" {
+		codeChallengeMethod = "S256"
+	}
 	redirectURI := q.Get("redirect_uri") // CLI sends its localhost callback URI
 	incomingState := q.Get("state")
 

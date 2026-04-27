@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 
+	"log/slog"
+
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/repository"
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/service"
 	"github.com/Collinsthegreat/hng14_stage1_backend/pkg/response"
@@ -46,13 +48,20 @@ func JWTAuth(userRepo repository.UserRepository) func(http.Handler) http.Handler
 
 			claims, err := service.ParseAndValidateJWT(raw, secret)
 			if err != nil {
+				slog.Error("JWT validation failed", "error", err)
 				response.Error(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
 
 			// Verify the user is still active in the database
 			u, err := userRepo.GetUserByID(r.Context(), claims.UserID)
-			if err != nil || u == nil {
+			if err != nil {
+				slog.Error("DB user lookup failed", "error", err, "user_id", claims.UserID)
+				response.Error(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+			if u == nil {
+				slog.Error("User not found in DB", "user_id", claims.UserID)
 				response.Error(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
