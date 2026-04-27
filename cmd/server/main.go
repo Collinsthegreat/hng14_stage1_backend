@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/username/repo-name/internal/bootstrap"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/bootstrap"
 )
 
 func main() {

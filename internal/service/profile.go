@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/username/repo-name/internal/client"
-	"github.com/username/repo-name/internal/model"
-	"github.com/username/repo-name/internal/repository"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/client"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/model"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/repository"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -29,6 +29,7 @@ type ProfileService interface {
 	CreateProfile(ctx context.Context, req model.CreateProfileRequest) (*model.Profile, bool, error)
 	GetProfile(ctx context.Context, id string) (*model.Profile, error)
 	ListProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, int, error)
+	ExportProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, error)
 	DeleteProfile(ctx context.Context, id string) error
 }
 
@@ -133,6 +134,11 @@ func (s *profileService) GetProfile(ctx context.Context, id string) (*model.Prof
 func (s *profileService) ListProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, int, error) {
 	return s.repo.List(ctx, f)
 }
+
+func (s *profileService) ExportProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, error) {
+	return s.repo.ListAll(ctx, f)
+}
+
 
 func (s *profileService) DeleteProfile(ctx context.Context, id string) error {
 	return s.repo.Delete(ctx, id)

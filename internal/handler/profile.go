@@ -1,17 +1,20 @@
 package handler
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/username/repo-name/internal/model"
-	"github.com/username/repo-name/internal/repository"
-	"github.com/username/repo-name/internal/service"
-	"github.com/username/repo-name/pkg/response"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/model"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/repository"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/service"
+	"github.com/Collinsthegreat/hng14_stage1_backend/pkg/response"
 )
 
 type ProfileHandler struct {
@@ -85,7 +88,9 @@ func (h *ProfileHandler) Get(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, http.StatusOK, p)
 }
 
-func (h *ProfileHandler) parseFilterParams(r *http.Request, f *repository.ProfileFilter) error {
+// parseFilterParams parses all query parameters into a ProfileFilter.
+// It also returns the raw url.Values so callers can reconstruct links.
+func (h *ProfileHandler) parseFilterParams(r *http.Request, f *repository.ProfileFilter) (url.Values, error) {
 	q := r.URL.Query()
 
 	if gn := q.Get("gender"); gn != "" {
@@ -120,33 +125,33 @@ func (h *ProfileHandler) parseFilterParams(r *http.Request, f *repository.Profil
 	}
 
 	if err := parseOptionalInt("min_age", &f.MinAge); err != nil {
-		return err
+		return nil, err
 	}
 	if err := parseOptionalInt("max_age", &f.MaxAge); err != nil {
-		return err
+		return nil, err
 	}
 	if err := parseOptionalFloat("min_gender_probability", &f.MinGenderProb); err != nil {
-		return err
+		return nil, err
 	}
 	if err := parseOptionalFloat("min_country_probability", &f.MinCountryProb); err != nil {
-		return err
+		return nil, err
 	}
 
 	f.SortBy = q.Get("sort_by")
 	if f.SortBy != "" && f.SortBy != "age" && f.SortBy != "created_at" && f.SortBy != "gender_probability" {
-		return fmt.Errorf("invalid sort_by")
+		return nil, fmt.Errorf("invalid sort_by")
 	}
 
 	f.Order = q.Get("order")
 	if f.Order != "" && f.Order != "asc" && f.Order != "desc" {
-		return fmt.Errorf("invalid order")
+		return nil, fmt.Errorf("invalid order")
 	}
 
 	f.Page = 1
 	if pgText := q.Get("page"); pgText != "" {
 		pg, err := strconv.Atoi(pgText)
 		if err != nil || pg <= 0 {
-			return fmt.Errorf("invalid page")
+			return nil, fmt.Errorf("invalid page")
 		}
 		f.Page = pg
 	}
@@ -155,7 +160,7 @@ func (h *ProfileHandler) parseFilterParams(r *http.Request, f *repository.Profil
 	if limText := q.Get("limit"); limText != "" {
 		lim, err := strconv.Atoi(limText)
 		if err != nil || lim <= 0 {
-			return fmt.Errorf("invalid limit")
+			return nil, fmt.Errorf("invalid limit")
 		}
 		if lim > 50 {
 			lim = 50 // clamp to 50
@@ -163,12 +168,22 @@ func (h *ProfileHandler) parseFilterParams(r *http.Request, f *repository.Profil
 		f.Limit = lim
 	}
 
-	return nil
+	// Build filter-only query values (no page/limit — those are added by PaginatedList)
+	filterParams := url.Values{}
+	for _, key := range []string{"gender", "age_group", "country_id", "min_age", "max_age",
+		"min_gender_probability", "min_country_probability", "sort_by", "order"} {
+		if val := q.Get(key); val != "" {
+			filterParams.Set(key, val)
+		}
+	}
+
+	return filterParams, nil
 }
 
 func (h *ProfileHandler) List(w http.ResponseWriter, r *http.Request) {
 	var filter repository.ProfileFilter
-	if err := h.parseFilterParams(r, &filter); err != nil {
+	filterParams, err := h.parseFilterParams(r, &filter)
+	if err != nil {
 		response.Error(w, http.StatusUnprocessableEntity, "Invalid query parameters")
 		return
 	}
@@ -180,7 +195,7 @@ func (h *ProfileHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.PaginatedList(w, filter.Page, filter.Limit, total, profiles)
+	response.PaginatedList(w, filter.Page, filter.Limit, total, "/api/profiles", filterParams, profiles)
 }
 
 func (h *ProfileHandler) Search(w http.ResponseWriter, r *http.Request) {
@@ -196,8 +211,7 @@ func (h *ProfileHandler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply pagination overrides if any
-	// Parse limit and page specifically so user can append ?limit=5
+	// Allow pagination overrides
 	if pgText := r.URL.Query().Get("page"); pgText != "" {
 		if pg, perr := strconv.Atoi(pgText); perr == nil && pg > 0 {
 			filter.Page = pg
@@ -225,7 +239,11 @@ func (h *ProfileHandler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response.PaginatedList(w, filter.Page, filter.Limit, total, profiles)
+	// Build filter params preserving the search query
+	filterParams := url.Values{}
+	filterParams.Set("q", query)
+
+	response.PaginatedList(w, filter.Page, filter.Limit, total, "/api/profiles/search", filterParams, profiles)
 }
 
 func (h *ProfileHandler) Delete(w http.ResponseWriter, r *http.Request) {
@@ -247,4 +265,70 @@ func (h *ProfileHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Export handles GET /api/profiles/export?format=csv.
+// Returns all matching profiles (up to 10,000 rows) as a CSV download.
+// Applies the same filters as List. No pagination.
+//
+// CSV column order: id,name,gender,gender_probability,age,age_group,country_id,country_name,country_probability,created_at
+func (h *ProfileHandler) Export(w http.ResponseWriter, r *http.Request) {
+	// Validate format param
+	if r.URL.Query().Get("format") != "csv" {
+		response.Error(w, http.StatusBadRequest, "unsupported format — use ?format=csv")
+		return
+	}
+
+	var filter repository.ProfileFilter
+	if _, err := h.parseFilterParams(r, &filter); err != nil {
+		response.Error(w, http.StatusUnprocessableEntity, "Invalid query parameters")
+		return
+	}
+
+	profiles, err := h.svc.ExportProfiles(r.Context(), filter)
+	if err != nil {
+		slog.Error("ExportProfiles error", "error", err)
+		response.Error(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	filename := fmt.Sprintf("profiles_%d.csv", time.Now().Unix())
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+
+	cw := csv.NewWriter(w)
+
+	// Header row — exact column order from spec
+	if err := cw.Write([]string{
+		"id", "name", "gender", "gender_probability",
+		"age", "age_group", "country_id", "country_name",
+		"country_probability", "created_at",
+	}); err != nil {
+		slog.Error("CSV write header error", "error", err)
+		return
+	}
+
+	for _, p := range profiles {
+		row := []string{
+			p.ID,
+			p.Name,
+			p.Gender,
+			strconv.FormatFloat(p.GenderProbability, 'f', 4, 64),
+			strconv.Itoa(p.Age),
+			p.AgeGroup,
+			p.CountryID,
+			p.CountryName,
+			strconv.FormatFloat(p.CountryProbability, 'f', 4, 64),
+			p.CreatedAt.UTC().Format(time.RFC3339),
+		}
+		if err := cw.Write(row); err != nil {
+			slog.Error("CSV write row error", "error", err)
+			return
+		}
+	}
+
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		slog.Error("CSV flush error", "error", err)
+	}
 }

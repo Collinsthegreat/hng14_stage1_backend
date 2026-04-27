@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/username/repo-name/internal/repository"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/repository"
 )
 
 var countryNameToCode = map[string]string{

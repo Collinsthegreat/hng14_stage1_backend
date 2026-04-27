@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/username/repo-name/internal/model"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/model"
 )
 
 type ProfileFilter struct {
@@ -30,6 +30,7 @@ type ProfileRepository interface {
 	GetByID(ctx context.Context, id string) (*model.Profile, error)
 	GetByName(ctx context.Context, name string) (*model.Profile, error)
 	List(ctx context.Context, f ProfileFilter) ([]model.Profile, int, error)
+	ListAll(ctx context.Context, f ProfileFilter) ([]model.Profile, error)
 	Delete(ctx context.Context, id string) error
 }
 
@@ -214,4 +215,102 @@ func (r *profileRepository) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("not found")
 	}
 	return nil
+}
+
+// ListAll returns all matching profiles without pagination.
+// A hard server-side cap of 10,000 rows is enforced to prevent memory exhaustion.
+const listAllRowCap = 10_000
+
+func (r *profileRepository) ListAll(ctx context.Context, f ProfileFilter) ([]model.Profile, error) {
+	args := []interface{}{}
+	argN := 1
+	where := []string{}
+
+	if f.Gender != nil {
+		where = append(where, fmt.Sprintf("LOWER(gender) = LOWER($%d)", argN))
+		args = append(args, *f.Gender)
+		argN++
+	}
+	if f.AgeGroup != nil {
+		where = append(where, fmt.Sprintf("LOWER(age_group) = LOWER($%d)", argN))
+		args = append(args, *f.AgeGroup)
+		argN++
+	}
+	if f.CountryID != nil {
+		where = append(where, fmt.Sprintf("LOWER(country_id) = LOWER($%d)", argN))
+		args = append(args, *f.CountryID)
+		argN++
+	}
+	if f.MinAge != nil {
+		where = append(where, fmt.Sprintf("age >= $%d", argN))
+		args = append(args, *f.MinAge)
+		argN++
+	}
+	if f.MaxAge != nil {
+		where = append(where, fmt.Sprintf("age <= $%d", argN))
+		args = append(args, *f.MaxAge)
+		argN++
+	}
+	if f.MinGenderProb != nil {
+		where = append(where, fmt.Sprintf("gender_probability >= $%d", argN))
+		args = append(args, *f.MinGenderProb)
+		argN++
+	}
+	if f.MinCountryProb != nil {
+		where = append(where, fmt.Sprintf("country_probability >= $%d", argN))
+		args = append(args, *f.MinCountryProb)
+		argN++
+	}
+
+	whereClause := ""
+	if len(where) > 0 {
+		whereClause = "WHERE " + strings.Join(where, " AND ")
+	}
+
+	allowedSortBy := map[string]string{
+		"age":                "age",
+		"created_at":         "created_at",
+		"gender_probability": "gender_probability",
+	}
+	sortCol, ok := allowedSortBy[f.SortBy]
+	if !ok {
+		sortCol = "created_at"
+	}
+	orderDir := "ASC"
+	if strings.ToLower(f.Order) == "desc" {
+		orderDir = "DESC"
+	}
+
+	dataQuery := fmt.Sprintf(
+		`SELECT id,name,gender,gender_probability,age,age_group,country_id,country_name,country_probability,created_at
+		 FROM profiles %s ORDER BY %s %s LIMIT $%d`,
+		whereClause, sortCol, orderDir, argN,
+	)
+	args = append(args, listAllRowCap)
+
+	rows, err := r.pool.Query(ctx, dataQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listAll query error: %w", err)
+	}
+	defer rows.Close()
+
+	var profiles []model.Profile
+	for rows.Next() {
+		var p model.Profile
+		if err := rows.Scan(
+			&p.ID, &p.Name, &p.Gender, &p.GenderProbability,
+			&p.Age, &p.AgeGroup, &p.CountryID, &p.CountryName,
+			&p.CountryProbability, &p.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("listAll row scan error: %w", err)
+		}
+		profiles = append(profiles, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if profiles == nil {
+		profiles = make([]model.Profile, 0)
+	}
+	return profiles, nil
 }

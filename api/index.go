@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/username/repo-name/internal/bootstrap"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/bootstrap"
 )
 
 var (

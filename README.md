@@ -1,77 +1,90 @@
-# Profiles API
+# Insighta Labs+ Backend
 
-## Tech Stack
-- Go 1.21+
-- chi router
-- PostgreSQL (Vercel Postgres / Neon)
-- pgx/v5
+This repository is the Stage 3 backend upgrade for Insighta Labs+, serving a multi-interface platform (Web Portal and CLI).
 
-## Project Structure
-```text
-.
-├── cmd/
-│   └── server/
-│       └── main.go
-├── internal/
-│   ├── bootstrap/
-│   │   └── bootstrap.go
-│   ├── handler/
-│   │   └── profile.go
-│   ├── service/
-│   │   └── profile.go
-│   ├── repository/
-│   │   └── profile.go
-│   ├── model/
-│   │   └── profile.go
-│   ├── client/
-│   │   ├── genderize.go
-│   │   ├── agify.go
-│   │   └── nationalize.go
-│   └── middleware/
-│       └── cors.go
-├── pkg/
-│   └── response/
-│       └── response.go
-├── db/
-│   └── migrations/
-│       └── 001_create_profiles.sql
-├── api/
-│   └── index.go
-├── vercel.json
-├── .env.example
-├── .gitignore
-├── go.mod
-└── README.md
-```
+## System Architecture
 
-## Local Setup
+The system consists of three main components:
+1. **Backend API (this repo):** Handles data storage, external API integration, authentication, and logic.
+2. **Web Portal (separate repo):** Server-side rendered or Next.js app interacting via HTTP cookies.
+3. **CLI (separate repo):** Interacts with the backend via explicit Bearer tokens using PKCE authentication.
+
+All clients connect to this backend for their operations.
+
+## Authentication Flow
+
+### Browser OAuth Flow
+1. **GET `/auth/github`** → Backend generates a random `state`, stores it, and redirects to GitHub.
+2. User authenticates on GitHub.
+3. **GET `/auth/github/callback`** → GitHub redirects back with `code` and `state`.
+4. Backend validates `state` and exchanges `code` for a GitHub access token.
+5. Backend fetches GitHub user information and upserts the user in the database.
+6. Backend issues an access token (JWT, 3min) and refresh token (opaque, hashed, 5min).
+7. Backend sets HTTP-only cookies (`access_token`, `refresh_token`) and redirects to the web portal dashboard.
+
+### CLI PKCE Flow
+1. CLI generates a `state`, `code_verifier`, and `code_challenge`.
+2. CLI starts a local HTTP server and opens the browser to `/auth/github?code_challenge=...`.
+3. Backend redirects to GitHub. After auth, GitHub redirects to `/auth/github/callback`.
+4. Backend validates `state` and exchanges `code` and `code_verifier` with GitHub.
+5. Backend issues tokens and returns them as a JSON payload to the CLI's callback server.
+6. CLI stores the tokens locally (`~/.insighta/credentials.json`) and prints a success message.
+
+## Token Handling
+
+- **Access token:** JWT, 3 minutes expiry, sent as an Authorization header (Bearer) or an HTTP-only cookie.
+- **Refresh token:** Opaque token, SHA-256 hashed in DB, 5 minutes expiry. Rotated on every use. Only one valid refresh token per user at a time.
+- **CLI auto-refresh:** The CLI automatically intercepts 401 Unauthorized responses, attempts a token refresh via `/auth/refresh`, and transparently retries the original request.
+
+## Role Enforcement
+
+Users are assigned roles upon creation.
+- **admin:** Full access (GET, POST, DELETE).
+- **analyst:** Read-only (GET only).
+
+All `/api/*` routes go through this middleware chain: `JWTAuth → APIVersion → RBAC`.
+
+## CLI Usage
+
+Install the CLI:
 ```bash
-git clone <repo-url>
-cd <repo>
-cp .env.example .env
-# Set DATABASE_URL from Vercel Postgres dashboard
-go mod tidy
-go run ./cmd/server
+go install github.com/Collinsthegreat/insighta-cli/cmd/insighta@latest
 ```
 
-## Environment Variables
-| Variable | Default | Description |
-|---|---|---|
-| DATABASE_URL | — | Vercel Postgres connection string |
-| PORT | 8080 | HTTP port |
-| HTTP_TIMEOUT_SECONDS | 5 | External API timeout |
+Available commands:
+```bash
+insighta login
+insighta logout
+insighta whoami
 
-## API Reference
+# Listing Profiles
+insighta profiles list
+insighta profiles list --gender male
+insighta profiles list --country NG --age-group adult
+insighta profiles list --min-age 25 --max-age 40
+insighta profiles list --sort-by age --order desc
+insighta profiles list --page 2 --limit 20
 
-### POST /api/profiles
-### GET /api/profiles?gender=&country_id=&age_group=
-### GET /api/profiles/{id}
-### DELETE /api/profiles/{id}
+# Get a single profile
+insighta profiles get <id>
 
+<<<<<<< HEAD
 ## Live URL
 https://hng14-stage1-backend.vercel.app
+=======
+# Natural language search
+insighta profiles search "young males from nigeria"
+>>>>>>> efad691 (feat(core): implement GitHub OAuth PKCE, RBAC, and CSV export)
 
-## Natural Language Search — How It Works
+# Creating a profile
+insighta profiles create --name "Harriet Tubman"
+
+# Exporting profiles to CSV
+insighta profiles export --format csv
+insighta profiles export --format csv --gender male --country NG
+```
+
+## Natural Language Parsing
 
 ### Supported Keywords & Mappings
 
@@ -89,16 +102,6 @@ https://hng14-stage1-backend.vercel.app
 | between {n} and {m}       | min_age=n, max_age=m                  |
 | from {country}            | country_id={ISO code}                 |
 
-### Parsing Logic
-1. Lowercase and trim query
-2. Detect gender keywords
-3. Detect "young/youth" → age range 16–24
-4. Detect age group keywords
-5. Detect age modifiers (above/below/between)
-6. Detect country via "from X" / "in X" pattern + country lookup map
-7. All detected filters combined as AND conditions
-8. Zero filters extracted → 422 "Unable to interpret query"
-
 ### Limitations
 - Only one gender can be matched per query (last match wins)
 - Country names must be in the supported lookup map
@@ -107,3 +110,46 @@ https://hng14-stage1-backend.vercel.app
 - Spelling errors are not corrected
 - Complex logical operators (OR, NOT) are not supported
 - "young" always maps to 16–24 regardless of context
+
+## API Reference
+
+### POST `/api/profiles`
+Create a new profile (Admin only).
+**Response:** `201 Created`
+
+### GET `/api/profiles`
+List profiles with pagination.
+**Response:**
+```json
+{
+  "status": "success",
+  "page": 1,
+  "limit": 10,
+  "total": 2026,
+  "total_pages": 203,
+  "links": {
+    "self": "/api/profiles?page=1&limit=10",
+    "next": "/api/profiles?page=2&limit=10",
+    "prev": null
+  },
+  "data": [ ... ]
+}
+```
+
+### GET `/api/profiles/{id}`
+Retrieve a profile by ID.
+
+### GET `/api/profiles/search`
+Search profiles via NLP. Returns paginated response.
+
+### GET `/api/profiles/export?format=csv`
+Export profiles as a CSV file.
+
+### DELETE `/api/profiles/{id}`
+Delete a profile (Admin only).
+
+## Live URLs
+
+- Backend: https://insighta-backend.vercel.app
+- Web Portal: https://insighta-web.vercel.app
+- CLI Install: `go install github.com/Collinsthegreat/insighta-cli/cmd/insighta@latest`

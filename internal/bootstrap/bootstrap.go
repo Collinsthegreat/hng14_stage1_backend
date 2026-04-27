@@ -3,26 +3,27 @@ package bootstrap
 import (
 	"context"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/Collinsthegreat/hng14_stage1_backend/db/migrations"
+	"github.com/Collinsthegreat/hng14_stage1_backend/db/seed"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/client"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/handler"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/middleware"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/repository"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/service"
+	"github.com/Collinsthegreat/hng14_stage1_backend/pkg/response"
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/username/repo-name/db/migrations"
-	"github.com/username/repo-name/db/seed"
-	"github.com/username/repo-name/internal/client"
-	"github.com/username/repo-name/internal/handler"
-	"github.com/username/repo-name/internal/middleware"
-	"github.com/username/repo-name/internal/repository"
-	"github.com/username/repo-name/internal/service"
-	"github.com/username/repo-name/pkg/response"
 )
 
 func NewRouter() http.Handler {
-	// Startup Sequence Step 1: Connect to DB pool
+	// ── Step 1: Database connection ───────────────────────────────────────────
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL is required")
@@ -33,32 +34,39 @@ func NewRouter() http.Handler {
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v", err)
 	}
+	slog.Info("Step 1: DB Pool connected")
 
-	log.Println("Step 1: DB Pool connected")
-
-	// Startup Sequence Step 2: Run migration 001
+	// ── Step 2: Migration 001 ─────────────────────────────────────────────────
 	if migrations.CreateProfilesSQL != "" {
 		if _, err := pool.Exec(ctx, migrations.CreateProfilesSQL); err != nil {
 			log.Fatalf("Failed to run migration 001: %v", err)
 		}
 	}
-	log.Println("Step 2: Migration 001 completed")
+	slog.Info("Step 2: Migration 001 completed")
 
-	// Startup Sequence Step 3: Run migration 002
+	// ── Step 3: Migration 002 ─────────────────────────────────────────────────
 	if migrations.AddCountryNameSQL != "" {
 		if _, err := pool.Exec(ctx, migrations.AddCountryNameSQL); err != nil {
 			log.Fatalf("Failed to run migration 002: %v", err)
 		}
 	}
-	log.Println("Step 3: Migration 002 completed")
+	slog.Info("Step 3: Migration 002 completed")
 
-	// Startup Sequence Step 4: Run Seeding
+	// ── Step 4: Migration 003 (users + refresh_tokens) ────────────────────────
+	if migrations.CreateUsersTokensSQL != "" {
+		if _, err := pool.Exec(ctx, migrations.CreateUsersTokensSQL); err != nil {
+			log.Fatalf("Failed to run migration 003: %v", err)
+		}
+	}
+	slog.Info("Step 4: Migration 003 completed")
+
+	// ── Step 5: Seed profiles ─────────────────────────────────────────────────
 	if err := seed.SeedProfiles(ctx, pool); err != nil {
 		log.Fatalf("Failed to run seed profiles: %v", err)
 	}
-	log.Println("Step 4: SeedProfiles completed")
+	slog.Info("Step 5: SeedProfiles completed")
 
-	// Setup external clients
+	// ── Step 6: External HTTP clients ─────────────────────────────────────────
 	timeoutStr := os.Getenv("HTTP_TIMEOUT_SECONDS")
 	timeoutSecs, err := strconv.Atoi(timeoutStr)
 	if err != nil || timeoutSecs <= 0 {
@@ -83,23 +91,35 @@ func NewRouter() http.Handler {
 	agifyClient := client.NewAgifyClient(httpClient, agifyBase)
 	natClient := client.NewNationalizeClient(httpClient, natBase)
 
-	// Setup Layers
-	repo := repository.NewProfileRepository(pool)
-	// Create NLP parser service
-	parserSvc := service.NewParserService()
-	svc := service.NewProfileService(repo, genderizeClient, agifyClient, natClient)
-	hdl := handler.NewProfileHandler(svc, parserSvc)
+	githubClient := client.NewGitHubClient(
+		httpClient,
+		os.Getenv("GITHUB_CLIENT_ID"),
+		os.Getenv("GITHUB_CLIENT_SECRET"),
+	)
 
-	// Setup Router
+	// ── Step 7: Repositories ──────────────────────────────────────────────────
+	profileRepo := repository.NewProfileRepository(pool)
+	userRepo := repository.NewUserRepository(pool)
+
+	// ── Step 8: Services ──────────────────────────────────────────────────────
+	parserSvc := service.NewParserService()
+	profileSvc := service.NewProfileService(profileRepo, genderizeClient, agifyClient, natClient)
+	authSvc := service.NewAuthService(userRepo, githubClient)
+
+	// ── Step 9: Handlers ──────────────────────────────────────────────────────
+	profileHdl := handler.NewProfileHandler(profileSvc, parserSvc)
+	authHdl := handler.NewAuthHandler(authSvc)
+
+	// ── Step 10: Router ───────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
-	// Global Middleware
-	r.Use(middleware.CORS)
+	// Global middleware (outermost first per spec)
+	r.Use(middleware.APICors)
 	r.Use(middleware.Logger)
 	r.Use(chiMiddleware.Recoverer)
 	r.Use(chiMiddleware.StripSlashes)
 
-	// Custom 404
+	// 404 / 405 handlers
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, http.StatusNotFound, "route not found")
 	})
@@ -107,14 +127,37 @@ func NewRouter() http.Handler {
 		response.Error(w, http.StatusNotFound, "route not found")
 	})
 
-	// Routes
-	// ORDER-SENSITIVE: /search MUST be registered before /{id}
-	r.Get("/api/profiles/search", hdl.Search)
-	r.Post("/api/profiles", hdl.Create)
-	r.Get("/api/profiles", hdl.List)
-	r.Get("/api/profiles/{id}", hdl.Get)
-	r.Delete("/api/profiles/{id}", hdl.Delete)
+	// ── Public auth routes (rate-limited per IP) ──────────────────────────────
+	r.With(middleware.AuthRateLimit).Get("/auth/github", authHdl.RedirectToGitHub)
+	r.With(middleware.AuthRateLimit).Get("/auth/github/callback", authHdl.HandleCallback)
 
-	log.Println("Step 5: HTTP Server / Router initialized")
+	// ── Token lifecycle — public (no JWT required) ────────────────────────────
+	// /auth/refresh is called when access token is expired — cannot require JWT
+	// /auth/logout reads refresh_token from body, no JWT needed
+	r.With(middleware.CSRF).Post("/auth/refresh", authHdl.Refresh)
+	r.With(middleware.CSRF).Post("/auth/logout", authHdl.Logout)
+
+	// ── Protected API routes ──────────────────────────────────────────────────
+	// Middleware chain: JWTAuth → APIVersion → (route-level) APIRateLimit → RBAC
+	jwtAuth := middleware.JWTAuth(userRepo)
+
+	r.Route("/api/profiles", func(r chi.Router) {
+		r.Use(jwtAuth)
+		r.Use(middleware.CSRF)
+		r.Use(middleware.APIVersion)
+		r.Use(middleware.APIRateLimit)
+
+		// Analyst + Admin (read operations) — order matters: /search and /export before /{id}
+		r.Get("/search", profileHdl.Search)
+		r.Get("/export", profileHdl.Export)
+		r.Get("/", profileHdl.List)
+		r.Get("/{id}", profileHdl.Get)
+
+		// Admin only
+		r.With(middleware.RequireRole("admin")).Post("/", profileHdl.Create)
+		r.With(middleware.RequireRole("admin")).Delete("/{id}", profileHdl.Delete)
+	})
+
+	slog.Info("Step 10: HTTP Server / Router initialized")
 	return r
 }
