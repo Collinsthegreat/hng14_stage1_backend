@@ -142,9 +142,9 @@ func NewRouter() http.Handler {
 	jwtAuth := middleware.JWTAuth(userRepo)
 
 	r.Route("/api/profiles", func(r chi.Router) {
+		r.Use(middleware.APIVersion)
 		r.Use(jwtAuth)
 		r.Use(middleware.CSRF)
-		r.Use(middleware.APIVersion)
 		r.Use(middleware.APIRateLimit)
 
 		// Analyst + Admin (read operations) — order matters: /search and /export before /{id}

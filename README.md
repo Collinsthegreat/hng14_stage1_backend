@@ -42,7 +42,7 @@ Users are assigned roles upon creation.
 - **admin:** Full access (GET, POST, DELETE).
 - **analyst:** Read-only (GET only).
 
-All `/api/*` routes go through this middleware chain: `JWTAuth → APIVersion → RBAC`.
+All `/api/*` routes go through this middleware chain: `APIVersion → JWTAuth → RBAC`.
 
 ## CLI Usage
 
@@ -68,13 +68,8 @@ insighta profiles list --page 2 --limit 20
 # Get a single profile
 insighta profiles get <id>
 
-<<<<<<< HEAD
-## Live URL
-https://hng14-stage1-backend.vercel.app
-=======
 # Natural language search
 insighta profiles search "young males from nigeria"
->>>>>>> efad691 (feat(core): implement GitHub OAuth PKCE, RBAC, and CSV export)
 
 # Creating a profile
 insighta profiles create --name "Harriet Tubman"
