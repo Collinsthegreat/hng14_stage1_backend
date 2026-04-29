@@ -26,20 +26,14 @@ func NewAuthHandler(svc service.AuthService) *AuthHandler {
 // Generates state, stores it, and redirects to GitHub OAuth.
 func (h *AuthHandler) RedirectToGitHub(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	codeChallenge := q.Get("code_challenge")
-	codeChallengeMethod := q.Get("code_challenge_method")
-	if codeChallenge != "" && codeChallengeMethod == "" {
-		codeChallengeMethod = "S256"
-	}
-	redirectURI := q.Get("redirect_uri") // CLI sends its localhost callback URI
 	incomingState := q.Get("state")
 
 	// Generate or use the provided state
 	var state string
+	var err error
 	if incomingState != "" {
 		state = incomingState
 	} else {
-		var err error
 		state, err = service.GenerateState()
 		if err != nil {
 			response.Error(w, http.StatusInternalServerError, "internal server error")
@@ -47,8 +41,18 @@ func (h *AuthHandler) RedirectToGitHub(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Store state → codeChallenge mapping with TTL
-	h.svc.StoreState(state, codeChallenge)
+	codeVerifier, err := service.GenerateCodeVerifier()
+	if err != nil {
+		response.Error(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	codeChallenge := service.GenerateCodeChallenge(codeVerifier)
+	codeChallengeMethod := "S256"
+
+	// Store state → codeVerifier mapping with TTL
+	h.svc.StoreState(state, codeVerifier)
+
+	redirectURI := q.Get("redirect_uri") // CLI sends its localhost callback URI
 
 	// Persist the CLI redirect_uri in state cookie so callback can return to it
 	if redirectURI != "" {
@@ -57,6 +61,16 @@ func (h *AuthHandler) RedirectToGitHub(w http.ResponseWriter, r *http.Request) {
 			Value:    redirectURI,
 			Path:     "/",
 			MaxAge:   600, // 10 minutes, matching state TTL
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
+	} else {
+		// Clear it for normal browser flows to prevent cross-contamination
+		http.SetCookie(w, &http.Cookie{
+			Name:     "cli_redirect_uri",
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
 			HttpOnly: true,
 			SameSite: http.SameSiteLaxMode,
 		})
@@ -81,8 +95,8 @@ func (h *AuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate and pop state
-	codeChallenge, ok := h.svc.ValidateAndPopState(state)
+	// Validate and pop state to get the stored code_verifier
+	codeVerifier, ok := h.svc.ValidateAndPopState(state)
 	if !ok {
 		response.Error(w, http.StatusBadRequest, "invalid or expired state")
 		return
@@ -94,12 +108,6 @@ func (h *AuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		cliRedirectURI = cookie.Value
 	}
 	isCLI := cliRedirectURI != ""
-
-	// For PKCE: codeVerifier would have been sent in the original request.
-	// We stored codeChallenge; the CLI must resend codeVerifier here.
-	// GitHub PKCE: the verifier is validated server-side by GitHub during code exchange.
-	codeVerifier := q.Get("code_verifier") // present in CLI callback
-	_ = codeChallenge                       // already validated in state store
 
 	user, accessToken, refreshToken, err := h.svc.HandleCallback(r.Context(), code, state, codeVerifier)
 	if err != nil {
@@ -136,6 +144,7 @@ func (h *AuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		cq.Set("access_token", accessToken)
 		cq.Set("refresh_token", refreshToken)
 		cq.Set("username", user.Username)
+		cq.Set("state", state) // Return the state back to the CLI
 		callbackURL.RawQuery = cq.Encode()
 		http.Redirect(w, r, callbackURL.String(), http.StatusFound)
 		return
@@ -226,7 +235,7 @@ func setAuthCookies(w http.ResponseWriter, accessToken, refreshToken string) {
 		MaxAge:   180, // 3 minutes
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteNoneMode,
 		Expires:  time.Now().Add(3 * time.Minute),
 	})
 	http.SetCookie(w, &http.Cookie{
@@ -236,13 +245,27 @@ func setAuthCookies(w http.ResponseWriter, accessToken, refreshToken string) {
 		MaxAge:   300, // 5 minutes
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteNoneMode,
 		Expires:  time.Now().Add(5 * time.Minute),
 	})
+
+	csrfToken, err := service.GenerateState()
+	if err == nil {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "csrf_token",
+			Value:    csrfToken,
+			Path:     "/",
+			MaxAge:   300,
+			HttpOnly: false, // Must be false so JS can read it for X-CSRF-Token header
+			Secure:   true,
+			SameSite: http.SameSiteNoneMode,
+			Expires:  time.Now().Add(5 * time.Minute),
+		})
+	}
 }
 
 func clearAuthCookies(w http.ResponseWriter) {
-	for _, name := range []string{"access_token", "refresh_token"} {
+	for _, name := range []string{"access_token", "refresh_token", "csrf_token"} {
 		http.SetCookie(w, &http.Cookie{
 			Name:     name,
 			Value:    "",
@@ -250,7 +273,7 @@ func clearAuthCookies(w http.ResponseWriter) {
 			MaxAge:   -1,
 			HttpOnly: true,
 			Secure:   true,
-			SameSite: http.SameSiteStrictMode,
+			SameSite: http.SameSiteNoneMode,
 		})
 	}
 }

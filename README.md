@@ -48,7 +48,7 @@ All `/api/*` routes go through this middleware chain: `APIVersion â†’ JWTAuth â†
 
 Install the CLI:
 ```bash
-go install github.com/Collinsthegreat/insighta-cli/cmd/insighta@latest
+go install github.com/Collinsthegreat/hng14_stage1_cli/cmd/insighta@latest
 ```
 
 Available commands:
@@ -143,8 +143,12 @@ Export profiles as a CSV file.
 ### DELETE `/api/profiles/{id}`
 Delete a profile (Admin only).
 
-## Live URLs
+## Live URLs & Repositories
 
-- Backend: https://insighta-backend.vercel.app
-- Web Portal: https://insighta-web.vercel.app
-- CLI Install: `go install github.com/Collinsthegreat/insighta-cli/cmd/insighta@latest`
+- **Backend Repo:** [https://github.com/Collinsthegreat/hng14_stage1_backend](https://github.com/Collinsthegreat/hng14_stage1_backend)
+- **CLI Repo:** [https://github.com/Collinsthegreat/hng14_stage1_cli](https://github.com/Collinsthegreat/hng14_stage1_cli)
+- **Web Portal Repo:** [https://github.com/Collinsthegreat/hng14_stage1_web](https://github.com/Collinsthegreat/hng14_stage1_web)
+
+- **Live Backend:** https://hng14-stage1-backend.vercel.app
+- **Live Web Portal:** (Vercel deployment URL here once deployed)
+- **CLI Install:** `go install github.com/Collinsthegreat/hng14_stage1_cli/cmd/insighta@latest`

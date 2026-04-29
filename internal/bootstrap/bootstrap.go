@@ -20,9 +20,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 )
 
 func NewRouter() http.Handler {
+	// Load .env file if it exists (for local development)
+	_ = godotenv.Load()
+
 	// ── Step 1: Database connection ───────────────────────────────────────────
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -114,7 +118,8 @@ func NewRouter() http.Handler {
 	r := chi.NewRouter()
 
 	// Global middleware (outermost first per spec)
-	r.Use(middleware.APICors)
+	// We only use Logger, Recoverer, StripSlashes globally.
+	// CORS is applied per route group to allow wildcard for auth and strict for API.
 	r.Use(middleware.Logger)
 	r.Use(chiMiddleware.Recoverer)
 	r.Use(chiMiddleware.StripSlashes)
@@ -128,20 +133,27 @@ func NewRouter() http.Handler {
 	})
 
 	// ── Public auth routes (rate-limited per IP) ──────────────────────────────
-	r.With(middleware.AuthRateLimit).Get("/auth/github", authHdl.RedirectToGitHub)
-	r.With(middleware.AuthRateLimit).Get("/auth/github/callback", authHdl.HandleCallback)
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.APICors) // Wildcard CORS for auth
+		r.Use(middleware.AuthRateLimit)
+		r.Get("/auth/github", authHdl.RedirectToGitHub)
+		r.Get("/auth/github/callback", authHdl.HandleCallback)
+	})
 
 	// ── Token lifecycle — public (no JWT required) ────────────────────────────
-	// /auth/refresh is called when access token is expired — cannot require JWT
-	// /auth/logout reads refresh_token from body, no JWT needed
-	r.With(middleware.CSRF).Post("/auth/refresh", authHdl.Refresh)
-	r.With(middleware.CSRF).Post("/auth/logout", authHdl.Logout)
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.APICors) // Wildcard CORS for auth
+		r.Use(middleware.CSRF)
+		r.Post("/auth/refresh", authHdl.Refresh)
+		r.Post("/auth/logout", authHdl.Logout)
+	})
 
 	// ── Protected API routes ──────────────────────────────────────────────────
 	// Middleware chain: JWTAuth → APIVersion → (route-level) APIRateLimit → RBAC
 	jwtAuth := middleware.JWTAuth(userRepo)
 
 	r.Route("/api/profiles", func(r chi.Router) {
+		r.Use(middleware.WebCors) // Requires credentials
 		r.Use(middleware.APIVersion)
 		r.Use(jwtAuth)
 		r.Use(middleware.CSRF)

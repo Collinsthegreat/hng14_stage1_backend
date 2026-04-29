@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -31,10 +32,10 @@ type Claims struct {
 
 // ─── State Store ───────────────────────────────────────────────────────────────
 
-// stateEntry holds a PKCE state value and an optional code_challenge.
+// stateEntry holds a PKCE code_verifier.
 type stateEntry struct {
-	codeChallenge string
-	expiresAt     time.Time
+	codeVerifier string
+	expiresAt    time.Time
 }
 
 // stateStore is an in-memory store for OAuth state values with TTL.
@@ -43,9 +44,9 @@ type stateStore struct {
 }
 
 // set stores a state entry with a 10-minute TTL.
-func (s *stateStore) set(state, codeChallenge string) {
+func (s *stateStore) set(state, codeVerifier string) {
 	s.mu.Store(state, stateEntry{
-		codeChallenge: codeChallenge,
+		codeVerifier: codeVerifier,
 		expiresAt:     time.Now().Add(10 * time.Minute),
 	})
 }
@@ -85,8 +86,8 @@ func (s *stateStore) startCleanup() {
 // AuthService handles GitHub OAuth, JWT issuance, and refresh token lifecycle.
 type AuthService interface {
 	BuildGitHubAuthURL(state, codeChallenge, codeChallengeMethod, redirectURI string) string
-	StoreState(state, codeChallenge string)
-	ValidateAndPopState(state string) (codeChallenge string, ok bool)
+	StoreState(state, codeVerifier string)
+	ValidateAndPopState(state string) (codeVerifier string, ok bool)
 	HandleCallback(ctx context.Context, code, state, codeVerifier string) (*model.User, string, string, error)
 	IssueTokenPair(ctx context.Context, user *model.User) (accessToken string, refreshToken string, err error)
 	RefreshTokens(ctx context.Context, rawRefreshToken string) (accessToken string, newRefreshToken string, err error)
@@ -138,9 +139,9 @@ func (s *authService) BuildGitHubAuthURL(state, codeChallenge, codeChallengeMeth
 	return "https://github.com/login/oauth/authorize?" + params.Encode()
 }
 
-// StoreState saves a state → codeChallenge mapping with 10-minute TTL.
-func (s *authService) StoreState(state, codeChallenge string) {
-	s.states.set(state, codeChallenge)
+// StoreState saves a state → codeVerifier mapping with 10-minute TTL.
+func (s *authService) StoreState(state, codeVerifier string) {
+	s.states.set(state, codeVerifier)
 }
 
 // ValidateAndPopState retrieves and removes a state entry.
@@ -149,7 +150,7 @@ func (s *authService) ValidateAndPopState(state string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	return entry.codeChallenge, true
+	return entry.codeVerifier, true
 }
 
 // HandleCallback validates the OAuth callback, exchanges the code, upserts the user, and issues tokens.
@@ -300,6 +301,21 @@ func GenerateState() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// GenerateCodeVerifier generates a high-entropy PKCE code verifier.
+func GenerateCodeVerifier() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// GenerateCodeChallenge derives the S256 code challenge from a verifier.
+func GenerateCodeChallenge(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
 // ParseAndValidateJWT validates a signed JWT string and returns the claims.
