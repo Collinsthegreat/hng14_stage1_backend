@@ -73,6 +73,38 @@ var countryNameToCode = map[string]string{
 	"canada":                   "CA",
 }
 
+var countryAliasToCode = map[string]string{
+	"nigerian":      "NG",
+	"ghanian":       "GH",
+	"ghanaian":      "GH",
+	"kenyan":        "KE",
+	"south african": "ZA",
+	"egyptian":      "EG",
+	"moroccan":      "MA",
+	"algerian":      "DZ",
+	"tunisian":      "TN",
+	"ugandan":       "UG",
+	"tanzanian":     "TZ",
+	"ethiopian":     "ET",
+	"cameroonian":   "CM",
+	"senegalese":    "SN",
+	"zambian":       "ZM",
+	"zimbabwean":    "ZW",
+	"rwandan":       "RW",
+	"canadian":      "CA",
+	"american":      "US",
+	"british":       "GB",
+	"french":        "FR",
+	"german":        "DE",
+	"italian":       "IT",
+	"spanish":       "ES",
+	"brazilian":     "BR",
+	"indian":        "IN",
+	"chinese":       "CN",
+	"japanese":      "JP",
+	"australian":    "AU",
+}
+
 type ParserService interface {
 	ParseSearchQuery(q string) (repository.ProfileFilter, error)
 }
@@ -84,7 +116,7 @@ func NewParserService() ParserService {
 }
 
 func (s *parserService) ParseSearchQuery(q string) (repository.ProfileFilter, error) {
-	lowerQ := strings.TrimSpace(strings.ToLower(q))
+	lowerQ := normalizeSearchText(q)
 	var filter repository.ProfileFilter
 	filterExtracted := false
 
@@ -141,18 +173,28 @@ func (s *parserService) ParseSearchQuery(q string) (repository.ProfileFilter, er
 		filter.MinAge = &minA
 		filter.MaxAge = &maxA
 		filterExtracted = true
+	} else if minA, maxA, ok := extractAgeRange(lowerQ); ok {
+		filter.MinAge = &minA
+		filter.MaxAge = &maxA
+		filterExtracted = true
 	}
 
 	// Country Modifiers
+	if code, ok := extractCountryCode(lowerQ); ok {
+		filter.CountryID = &code
+		filterExtracted = true
+	}
 	for country, code := range countryNameToCode {
 		patterns := []string{
 			"from " + country,
 			"in " + country,
+			"living in " + country,
+			"based in " + country,
 			country + " people",
 			country + " citizens",
 		}
 		for _, pat := range patterns {
-			if strings.Contains(lowerQ, pat) {
+			if hasPhrase(lowerQ, pat) {
 				c := code
 				filter.CountryID = &c
 				filterExtracted = true
@@ -160,6 +202,14 @@ func (s *parserService) ParseSearchQuery(q string) (repository.ProfileFilter, er
 			}
 		}
 		if filter.CountryID != nil {
+			break
+		}
+	}
+	for alias, code := range countryAliasToCode {
+		if hasPhrase(lowerQ, alias) {
+			c := code
+			filter.CountryID = &c
+			filterExtracted = true
 			break
 		}
 	}
@@ -178,6 +228,28 @@ func (s *parserService) ParseSearchQuery(q string) (repository.ProfileFilter, er
 	return filter, nil
 }
 
+func normalizeSearchText(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	text = strings.NewReplacer(
+		"–", "-",
+		"—", "-",
+		"_", " ",
+		",", " ",
+		".", " ",
+		";", " ",
+		":", " ",
+		"?", " ",
+		"!", " ",
+		"(", " ",
+		")", " ",
+		"[", " ",
+		"]", " ",
+		"{", " ",
+		"}", " ",
+	).Replace(text)
+	return strings.Join(strings.Fields(text), " ")
+}
+
 func hasWord(text string, words []string) bool {
 	// Pad spaces around to ensure exact match, or use regex
 	padded := " " + text + " "
@@ -187,6 +259,10 @@ func hasWord(text string, words []string) bool {
 		}
 	}
 	return false
+}
+
+func hasPhrase(text, phrase string) bool {
+	return strings.Contains(" "+text+" ", " "+phrase+" ")
 }
 
 func extractModifier(text string, prefixes []string) (int, bool) {
@@ -207,7 +283,7 @@ func extractModifier(text string, prefixes []string) (int, bool) {
 }
 
 func extractBetween(text string) (int, int, bool) {
-	re := regexp.MustCompile(`between\s+(\d+)\s+and\s+(\d+)`)
+	re := regexp.MustCompile(`between(?:\s+ages?)?\s+(\d+)\s+(?:and|to|-)\s+(\d+)`)
 	matches := re.FindStringSubmatch(text)
 	if len(matches) == 3 {
 		min, err1 := strconv.Atoi(matches[1])
@@ -217,4 +293,37 @@ func extractBetween(text string) (int, int, bool) {
 		}
 	}
 	return 0, 0, false
+}
+
+func extractAgeRange(text string) (int, int, bool) {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?:aged?|ages?)\s+(\d+)\s*(?:-|to|and)\s*(\d+)`),
+		regexp.MustCompile(`\b(\d+)\s*(?:-|to)\s*(\d+)\b`),
+	}
+	for _, re := range patterns {
+		matches := re.FindStringSubmatch(text)
+		if len(matches) == 3 {
+			min, err1 := strconv.Atoi(matches[1])
+			max, err2 := strconv.Atoi(matches[2])
+			if err1 == nil && err2 == nil {
+				return min, max, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+func extractCountryCode(text string) (string, bool) {
+	re := regexp.MustCompile(`(?:from|in|living in|based in)\s+([a-z]{2})\b`)
+	matches := re.FindStringSubmatch(text)
+	if len(matches) != 2 {
+		return "", false
+	}
+	code := strings.ToUpper(matches[1])
+	for _, known := range countryNameToCode {
+		if code == known {
+			return code, true
+		}
+	}
+	return "", false
 }

@@ -1,13 +1,17 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"time"
 
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/middleware"
+	"github.com/Collinsthegreat/hng14_stage1_backend/internal/model"
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/service"
 	"github.com/Collinsthegreat/hng14_stage1_backend/pkg/response"
 )
@@ -27,6 +31,13 @@ func NewAuthHandler(svc service.AuthService) *AuthHandler {
 func (h *AuthHandler) RedirectToGitHub(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	incomingState := q.Get("state")
+	codeChallenge := q.Get("code_challenge")
+	codeChallengeMethod := ""
+	if codeChallenge != "" {
+		codeChallengeMethod = "S256"
+	}
+	redirectURI := q.Get("redirect_uri")
+	isCLI := codeChallenge != ""
 
 	// Generate or use the provided state
 	var state string
@@ -41,40 +52,8 @@ func (h *AuthHandler) RedirectToGitHub(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	codeVerifier, err := service.GenerateCodeVerifier()
-	if err != nil {
-		response.Error(w, http.StatusInternalServerError, "internal server error")
-		return
-	}
-	codeChallenge := service.GenerateCodeChallenge(codeVerifier)
-	codeChallengeMethod := "S256"
-
-	// Store state → codeVerifier mapping with TTL
-	h.svc.StoreState(state, codeVerifier)
-
-	redirectURI := q.Get("redirect_uri") // CLI sends its localhost callback URI
-
-	// Persist the CLI redirect_uri in state cookie so callback can return to it
-	if redirectURI != "" {
-		http.SetCookie(w, &http.Cookie{
-			Name:     "cli_redirect_uri",
-			Value:    redirectURI,
-			Path:     "/",
-			MaxAge:   600, // 10 minutes, matching state TTL
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-		})
-	} else {
-		// Clear it for normal browser flows to prevent cross-contamination
-		http.SetCookie(w, &http.Cookie{
-			Name:     "cli_redirect_uri",
-			Value:    "",
-			Path:     "/",
-			MaxAge:   -1,
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-		})
-	}
+	// Store state with the original PKCE code_challenge for callback validation.
+	h.svc.StoreState(state, codeChallenge, redirectURI, isCLI)
 
 	githubURL := h.svc.BuildGitHubAuthURL(state, codeChallenge, codeChallengeMethod, redirectURI)
 	http.Redirect(w, r, githubURL, http.StatusFound)
@@ -89,25 +68,22 @@ func (h *AuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	code := q.Get("code")
 	state := q.Get("state")
+	codeVerifier := q.Get("code_verifier")
 
 	if code == "" || state == "" {
 		response.Error(w, http.StatusBadRequest, "missing code or state")
 		return
 	}
 
-	// Validate and pop state to get the stored code_verifier
-	codeVerifier, ok := h.svc.ValidateAndPopState(state)
-	if !ok {
-		response.Error(w, http.StatusBadRequest, "invalid or expired state")
+	storedState, err := h.svc.ValidateAndPopState(state, codeVerifier)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidCodeVerifier) {
+			response.Error(w, http.StatusBadRequest, "invalid code verifier")
+			return
+		}
+		response.Error(w, http.StatusBadRequest, "invalid state")
 		return
 	}
-
-	// Determine if this is a CLI flow by checking for stored CLI redirect URI
-	cliRedirectURI := ""
-	if cookie, err := r.Cookie("cli_redirect_uri"); err == nil {
-		cliRedirectURI = cookie.Value
-	}
-	isCLI := cliRedirectURI != ""
 
 	user, accessToken, refreshToken, err := h.svc.HandleCallback(r.Context(), code, state, codeVerifier)
 	if err != nil {
@@ -116,35 +92,49 @@ func (h *AuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if isCLI {
-		// CLI flow: POST JSON to the CLI's local callback server
-		// Clear the CLI cookie
-		http.SetCookie(w, &http.Cookie{
-			Name:   "cli_redirect_uri",
-			Value:  "",
-			MaxAge: -1,
-			Path:   "/",
-		})
+	if storedState.IsCLI {
+		payload := map[string]interface{}{
+			"status":        "success",
+			"access_token":  accessToken,
+			"refresh_token": refreshToken,
+			"username":      user.Username,
+		}
+		if storedState.RedirectURI != "" {
+			if err := deliverCLIAuthPayload(storedState.RedirectURI, payload); err != nil {
+				slog.Warn("cli callback delivery failed", "error", err, "redirect_uri", storedState.RedirectURI)
+				if codeVerifier == "" {
+					callbackURL, parseErr := url.Parse(storedState.RedirectURI)
+					if parseErr != nil {
+						response.Error(w, http.StatusInternalServerError, "invalid CLI redirect URI")
+						return
+					}
+					cq := callbackURL.Query()
+					cq.Set("access_token", accessToken)
+					cq.Set("refresh_token", refreshToken)
+					cq.Set("username", user.Username)
+					cq.Set("state", state)
+					callbackURL.RawQuery = cq.Encode()
+					http.Redirect(w, r, callbackURL.String(), http.StatusFound)
+					return
+				}
+			}
+		}
 
-		// Redirect CLI's localhost server with tokens as query params (safe for localhost)
-		// OR: proxy the response as JSON to redirect_uri
-		callbackURL, err := url.Parse(cliRedirectURI)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(payload)
+		return
+	}
+	if storedState.RedirectURI != "" {
+		callbackURL, err := url.Parse(storedState.RedirectURI)
 		if err != nil {
 			response.Error(w, http.StatusInternalServerError, "invalid CLI redirect URI")
 			return
 		}
-
-		// Send JSON directly to the CLI callback
-		// We redirect with a 302 and let the CLI server receive it,
-		// but the spec says "returns JSON to redirect_uri" — so we POST JSON.
-		// Since we can't POST from a redirect, we render an HTML page that auto-posts,
-		// OR (simpler and more robust) we include tokens as query params for the CLI to read.
-		// Best practice: embed tokens in URL fragment or body. We'll use query params on localhost only.
 		cq := callbackURL.Query()
 		cq.Set("access_token", accessToken)
 		cq.Set("refresh_token", refreshToken)
 		cq.Set("username", user.Username)
-		cq.Set("state", state) // Return the state back to the CLI
+		cq.Set("state", state)
 		callbackURL.RawQuery = cq.Encode()
 		http.Redirect(w, r, callbackURL.String(), http.StatusFound)
 		return
@@ -161,7 +151,18 @@ func (h *AuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if frontendURL == "" {
 		dashboardURL = "/dashboard"
 	}
-	http.Redirect(w, r, dashboardURL, http.StatusFound)
+	redirectURL, err := url.Parse(dashboardURL)
+	if err != nil {
+		slog.Error("invalid frontend redirect url", "error", err, "url", dashboardURL)
+		response.Error(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	query := redirectURL.Query()
+	query.Set("access_token", accessToken)
+	query.Set("refresh_token", refreshToken)
+	query.Set("username", user.Username)
+	redirectURL.RawQuery = query.Encode()
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
 }
 
 // Refresh handles POST /auth/refresh.
@@ -172,7 +173,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		RefreshToken string `json:"refresh_token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.RefreshToken == "" {
-		response.Error(w, http.StatusUnauthorized, "unauthorized")
+		response.Error(w, http.StatusBadRequest, "refresh_token required")
 		return
 	}
 
@@ -200,20 +201,19 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		RefreshToken string `json:"refresh_token"`
 	}
-	// Best-effort decode — may be empty for browser clients using cookies
-	_ = json.NewDecoder(r.Body).Decode(&body)
-
-	// Fallback: read from cookie (web portal)
-	if body.RefreshToken == "" {
-		if cookie, err := r.Cookie("refresh_token"); err == nil {
-			body.RefreshToken = cookie.Value
-		}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.RefreshToken == "" {
+		response.Error(w, http.StatusBadRequest, "refresh_token required")
+		return
 	}
 
-	if body.RefreshToken != "" {
-		if err := h.svc.Logout(r.Context(), body.RefreshToken); err != nil {
-			slog.Error("logout error", "error", err)
+	if err := h.svc.Logout(r.Context(), body.RefreshToken); err != nil {
+		if service.IsAuthError(err) {
+			response.Error(w, http.StatusUnauthorized, "invalid refresh token")
+			return
 		}
+		slog.Error("logout error", "error", err)
+		response.Error(w, http.StatusInternalServerError, "internal server error")
+		return
 	}
 
 	// Clear cookies (browser clients)
@@ -225,7 +225,56 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Me handles GET /api/users/me.
+func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
+	userID := middleware.UserIDFromContext(r.Context())
+	if userID == "" {
+		response.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	user, err := h.svc.GetUserByID(r.Context(), userID)
+	if err != nil {
+		slog.Error("me lookup error", "error", err, "user_id", userID)
+		response.Error(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	if user == nil {
+		response.Error(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	response.JSON(w, http.StatusOK, map[string]any{
+		"status": "success",
+		"data":   userSelfResponse(user),
+	})
+}
+
 // ─── Cookie helpers ────────────────────────────────────────────────────────────
+
+type selfResponse struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	Email       string `json:"email"`
+	AvatarURL   string `json:"avatar_url"`
+	Role        string `json:"role"`
+	IsActive    bool   `json:"is_active"`
+	LastLoginAt any    `json:"last_login_at"`
+	CreatedAt   any    `json:"created_at"`
+}
+
+func userSelfResponse(u *model.User) selfResponse {
+	return selfResponse{
+		ID:          u.ID,
+		Username:    u.Username,
+		Email:       u.Email,
+		AvatarURL:   u.AvatarURL,
+		Role:        u.Role,
+		IsActive:    u.IsActive,
+		LastLoginAt: u.LastLoginAt,
+		CreatedAt:   u.CreatedAt,
+	}
+}
 
 func setAuthCookies(w http.ResponseWriter, accessToken, refreshToken string) {
 	http.SetCookie(w, &http.Cookie{
@@ -235,8 +284,7 @@ func setAuthCookies(w http.ResponseWriter, accessToken, refreshToken string) {
 		MaxAge:   180, // 3 minutes
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteNoneMode,
-		Expires:  time.Now().Add(3 * time.Minute),
+		SameSite: http.SameSiteStrictMode,
 	})
 	http.SetCookie(w, &http.Cookie{
 		Name:     "refresh_token",
@@ -245,27 +293,12 @@ func setAuthCookies(w http.ResponseWriter, accessToken, refreshToken string) {
 		MaxAge:   300, // 5 minutes
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteNoneMode,
-		Expires:  time.Now().Add(5 * time.Minute),
+		SameSite: http.SameSiteStrictMode,
 	})
-
-	csrfToken, err := service.GenerateState()
-	if err == nil {
-		http.SetCookie(w, &http.Cookie{
-			Name:     "csrf_token",
-			Value:    csrfToken,
-			Path:     "/",
-			MaxAge:   300,
-			HttpOnly: false, // Must be false so JS can read it for X-CSRF-Token header
-			Secure:   true,
-			SameSite: http.SameSiteNoneMode,
-			Expires:  time.Now().Add(5 * time.Minute),
-		})
-	}
 }
 
 func clearAuthCookies(w http.ResponseWriter) {
-	for _, name := range []string{"access_token", "refresh_token", "csrf_token"} {
+	for _, name := range []string{"access_token", "refresh_token"} {
 		http.SetCookie(w, &http.Cookie{
 			Name:     name,
 			Value:    "",
@@ -273,7 +306,32 @@ func clearAuthCookies(w http.ResponseWriter) {
 			MaxAge:   -1,
 			HttpOnly: true,
 			Secure:   true,
-			SameSite: http.SameSiteNoneMode,
+			SameSite: http.SameSiteStrictMode,
 		})
 	}
+}
+
+func deliverCLIAuthPayload(redirectURI string, payload map[string]interface{}) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, redirectURI, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return errors.New("cli callback rejected payload")
+	}
+
+	return nil
 }

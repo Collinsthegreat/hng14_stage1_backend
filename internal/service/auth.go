@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -32,11 +33,26 @@ type Claims struct {
 
 // ─── State Store ───────────────────────────────────────────────────────────────
 
-// stateEntry holds a PKCE code_verifier.
+// stateEntry holds the PKCE challenge and callback metadata for one OAuth flow.
 type stateEntry struct {
-	codeVerifier string
-	expiresAt    time.Time
+	state         string
+	codeChallenge string
+	expiresAt     time.Time
+	redirectURI   string
+	isCLI         bool
 }
+
+// StoredState is the validated OAuth state data returned to handlers.
+type StoredState struct {
+	CodeChallenge string
+	RedirectURI   string
+	IsCLI         bool
+}
+
+var (
+	ErrInvalidState        = errors.New("invalid state")
+	ErrInvalidCodeVerifier = errors.New("invalid code verifier")
+)
 
 // stateStore is an in-memory store for OAuth state values with TTL.
 type stateStore struct {
@@ -44,15 +60,18 @@ type stateStore struct {
 }
 
 // set stores a state entry with a 10-minute TTL.
-func (s *stateStore) set(state, codeVerifier string) {
+func (s *stateStore) set(state, codeChallenge, redirectURI string, isCLI bool) {
 	s.mu.Store(state, stateEntry{
-		codeVerifier: codeVerifier,
+		state:         state,
+		codeChallenge: codeChallenge,
 		expiresAt:     time.Now().Add(10 * time.Minute),
+		redirectURI:   redirectURI,
+		isCLI:         isCLI,
 	})
 }
 
-// get retrieves and deletes a state entry, returning false if missing or expired.
-func (s *stateStore) get(state string) (stateEntry, bool) {
+// pop retrieves and deletes a state entry, returning false if missing or expired.
+func (s *stateStore) pop(state string) (stateEntry, bool) {
 	v, ok := s.mu.LoadAndDelete(state)
 	if !ok {
 		return stateEntry{}, false
@@ -86,19 +105,20 @@ func (s *stateStore) startCleanup() {
 // AuthService handles GitHub OAuth, JWT issuance, and refresh token lifecycle.
 type AuthService interface {
 	BuildGitHubAuthURL(state, codeChallenge, codeChallengeMethod, redirectURI string) string
-	StoreState(state, codeVerifier string)
-	ValidateAndPopState(state string) (codeVerifier string, ok bool)
+	StoreState(state, codeChallenge, redirectURI string, isCLI bool)
+	ValidateAndPopState(state, codeVerifier string) (StoredState, error)
 	HandleCallback(ctx context.Context, code, state, codeVerifier string) (*model.User, string, string, error)
 	IssueTokenPair(ctx context.Context, user *model.User) (accessToken string, refreshToken string, err error)
 	RefreshTokens(ctx context.Context, rawRefreshToken string) (accessToken string, newRefreshToken string, err error)
 	Logout(ctx context.Context, rawRefreshToken string) error
+	GetUserByID(ctx context.Context, userID string) (*model.User, error)
 }
 
 type authService struct {
-	userRepo    repository.UserRepository
-	githubCli   client.GitHubClient
-	jwtSecret   []byte
-	states      stateStore
+	userRepo          repository.UserRepository
+	githubCli         client.GitHubClient
+	jwtSecret         []byte
+	states            stateStore
 	githubRedirectURI string
 }
 
@@ -139,18 +159,27 @@ func (s *authService) BuildGitHubAuthURL(state, codeChallenge, codeChallengeMeth
 	return "https://github.com/login/oauth/authorize?" + params.Encode()
 }
 
-// StoreState saves a state → codeVerifier mapping with 10-minute TTL.
-func (s *authService) StoreState(state, codeVerifier string) {
-	s.states.set(state, codeVerifier)
+// StoreState saves a state with its PKCE code challenge and flow metadata.
+func (s *authService) StoreState(state, codeChallenge, redirectURI string, isCLI bool) {
+	s.states.set(state, codeChallenge, redirectURI, isCLI)
 }
 
-// ValidateAndPopState retrieves and removes a state entry.
-func (s *authService) ValidateAndPopState(state string) (string, bool) {
-	entry, ok := s.states.get(state)
+// ValidateAndPopState retrieves, validates, and removes a state entry.
+func (s *authService) ValidateAndPopState(state, codeVerifier string) (StoredState, error) {
+	entry, ok := s.states.pop(state)
 	if !ok {
-		return "", false
+		return StoredState{}, ErrInvalidState
 	}
-	return entry.codeVerifier, true
+	if entry.codeChallenge != "" {
+		if codeVerifier == "" || GenerateCodeChallenge(codeVerifier) != entry.codeChallenge {
+			return StoredState{}, ErrInvalidCodeVerifier
+		}
+	}
+	return StoredState{
+		CodeChallenge: entry.codeChallenge,
+		RedirectURI:   entry.redirectURI,
+		IsCLI:         entry.isCLI,
+	}, nil
 }
 
 // HandleCallback validates the OAuth callback, exchanges the code, upserts the user, and issues tokens.
@@ -176,7 +205,6 @@ func (s *authService) HandleCallback(ctx context.Context, code, state, codeVerif
 		Username:    ghUser.Login,
 		Email:       ghUser.Email,
 		AvatarURL:   ghUser.AvatarURL,
-		Role:        "analyst",
 		IsActive:    true,
 		LastLoginAt: &now,
 		CreatedAt:   now,
@@ -255,17 +283,22 @@ func (s *authService) RefreshTokens(ctx context.Context, rawRefreshToken string)
 	return s.IssueTokenPair(ctx, u)
 }
 
-// Logout invalidates all refresh tokens for the user identified by the raw refresh token.
+// Logout invalidates the refresh token identified by the raw refresh token.
 func (s *authService) Logout(ctx context.Context, rawRefreshToken string) error {
 	tokenHash := hashToken(rawRefreshToken)
 	rt, err := s.userRepo.GetRefreshTokenByHash(ctx, tokenHash)
 	if err != nil {
 		return err
 	}
-	if rt == nil {
-		return nil // already invalid — treat as success
+	if rt == nil || rt.Used || time.Now().After(rt.ExpiresAt) {
+		return &AuthError{Message: "invalid refresh token"}
 	}
-	return s.userRepo.InvalidateUserRefreshTokens(ctx, rt.UserID)
+	return s.userRepo.InvalidateRefreshToken(ctx, tokenHash)
+}
+
+// GetUserByID fetches a user for authenticated self-service endpoints.
+func (s *authService) GetUserByID(ctx context.Context, userID string) (*model.User, error) {
+	return s.userRepo.GetUserByID(ctx, userID)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────

@@ -1,8 +1,12 @@
 package middleware
 
 import (
+	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Collinsthegreat/hng14_stage1_backend/pkg/response"
@@ -13,49 +17,53 @@ import (
 
 type limiterEntry struct {
 	limiter  *rate.Limiter
-	lastSeen time.Time
+	lastSeen atomic.Int64
 }
 
 type limiterStore struct {
-	mu       sync.Mutex
-	limiters map[string]*limiterEntry
+	limiters sync.Map
 	r        rate.Limit
 	b        int
 }
 
 func newLimiterStore(r rate.Limit, b int) *limiterStore {
 	s := &limiterStore{
-		limiters: make(map[string]*limiterEntry),
-		r:        r,
-		b:        b,
+		r: r,
+		b: b,
 	}
 	// Cleanup goroutine: evict entries idle for > 5 minutes
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			s.mu.Lock()
-			for k, e := range s.limiters {
-				if time.Since(e.lastSeen) > 5*time.Minute {
-					delete(s.limiters, k)
+			now := time.Now()
+			s.limiters.Range(func(k, v any) bool {
+				entry := v.(*limiterEntry)
+				lastSeen := time.Unix(0, entry.lastSeen.Load())
+				if now.Sub(lastSeen) > 5*time.Minute {
+					s.limiters.Delete(k)
 				}
-			}
-			s.mu.Unlock()
+				return true
+			})
 		}
 	}()
 	return s
 }
 
 func (s *limiterStore) getLimiter(key string) *rate.Limiter {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.limiters[key]
-	if !ok {
-		e = &limiterEntry{limiter: rate.NewLimiter(s.r, s.b)}
-		s.limiters[key] = e
+	now := time.Now().UnixNano()
+	if v, ok := s.limiters.Load(key); ok {
+		entry := v.(*limiterEntry)
+		entry.lastSeen.Store(now)
+		return entry.limiter
 	}
-	e.lastSeen = time.Now()
-	return e.limiter
+
+	entry := &limiterEntry{limiter: rate.NewLimiter(s.r, s.b)}
+	entry.lastSeen.Store(now)
+	actual, _ := s.limiters.LoadOrStore(key, entry)
+	stored := actual.(*limiterEntry)
+	stored.lastSeen.Store(now)
+	return stored.limiter
 }
 
 // ─── Middleware factories ──────────────────────────────────────────────────────
@@ -71,7 +79,11 @@ var apiLimiterStore = newLimiterStore(rate.Every(time.Second), 60)
 // AuthRateLimit limits /auth/* to 10 requests/min per IP.
 func AuthRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := realIP(r)
+		ip := remoteIP(r)
+		if isWhitelistedIP(ip) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !authLimiterStore.getLimiter(ip).Allow() {
 			response.Error(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
@@ -85,7 +97,7 @@ func APIRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := UserIDFromContext(r.Context())
 		if key == "" {
-			key = realIP(r)
+			key = remoteIP(r)
 		}
 		if !apiLimiterStore.getLimiter(key).Allow() {
 			response.Error(w, http.StatusTooManyRequests, "rate limit exceeded")
@@ -95,26 +107,28 @@ func APIRateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// realIP extracts the client IP, respecting common proxy headers.
-func realIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
+// remoteIP extracts the client IP from RemoteAddr and strips the port.
+func remoteIP(r *http.Request) string {
+	addr := strings.TrimSpace(r.RemoteAddr)
+	if addr == "" {
+		return "unknown"
 	}
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		// First IP in a comma-separated list
-		for i := 0; i < len(ip); i++ {
-			if ip[i] == ',' {
-				return ip[:i]
-			}
-		}
-		return ip
-	}
-	// Strip port from RemoteAddr
-	addr := r.RemoteAddr
-	for i := len(addr) - 1; i >= 0; i-- {
-		if addr[i] == ':' {
-			return addr[:i]
-		}
+	host, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		return host
 	}
 	return addr
+}
+
+func isWhitelistedIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed != nil && parsed.IsLoopback() {
+		return true
+	}
+	for _, allowed := range strings.Split(os.Getenv("RATE_LIMIT_WHITELIST"), ",") {
+		if strings.TrimSpace(allowed) == ip {
+			return true
+		}
+	}
+	return false
 }

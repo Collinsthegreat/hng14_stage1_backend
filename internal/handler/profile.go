@@ -8,13 +8,14 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/model"
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/repository"
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/service"
 	"github.com/Collinsthegreat/hng14_stage1_backend/pkg/response"
+	"github.com/go-chi/chi/v5"
 )
 
 type ProfileHandler struct {
@@ -138,11 +139,13 @@ func (h *ProfileHandler) parseFilterParams(r *http.Request, f *repository.Profil
 	}
 
 	f.SortBy = q.Get("sort_by")
+	f.SortBy = strings.ToLower(strings.TrimSpace(f.SortBy))
 	if f.SortBy != "" && f.SortBy != "age" && f.SortBy != "created_at" && f.SortBy != "gender_probability" {
 		return nil, fmt.Errorf("invalid sort_by")
 	}
 
 	f.Order = q.Get("order")
+	f.Order = strings.ToLower(strings.TrimSpace(f.Order))
 	if f.Order != "" && f.Order != "asc" && f.Order != "desc" {
 		return nil, fmt.Errorf("invalid order")
 	}

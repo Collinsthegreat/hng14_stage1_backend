@@ -34,7 +34,17 @@ func NewRouter() http.Handler {
 	}
 
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dbURL)
+	poolConfig, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		log.Fatalf("Invalid DATABASE_URL: %v", err)
+	}
+	poolConfig.MaxConns = 20
+	poolConfig.MinConns = 5
+	poolConfig.MaxConnLifetime = 30 * time.Minute
+	poolConfig.MaxConnIdleTime = 5 * time.Minute
+	poolConfig.HealthCheckPeriod = 1 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v", err)
 	}
@@ -63,6 +73,14 @@ func NewRouter() http.Handler {
 		}
 	}
 	slog.Info("Step 4: Migration 003 completed")
+
+	// ── Step 4B: Migration 004 (performance indexes) ─────────────────────────
+	if migrations.PerformanceIndexesSQL != "" {
+		if _, err := pool.Exec(ctx, migrations.PerformanceIndexesSQL); err != nil {
+			log.Fatalf("Failed to run migration 004: %v", err)
+		}
+	}
+	slog.Info("Step 4B: Migration 004 completed")
 
 	// ── Step 5: Seed profiles ─────────────────────────────────────────────────
 	if err := seed.SeedProfiles(ctx, pool); err != nil {
@@ -107,7 +125,8 @@ func NewRouter() http.Handler {
 
 	// ── Step 8: Services ──────────────────────────────────────────────────────
 	parserSvc := service.NewParserService()
-	profileSvc := service.NewProfileService(profileRepo, genderizeClient, agifyClient, natClient)
+	cacheSvc := service.NewCacheServiceFromEnv(60 * time.Second)
+	profileSvc := service.NewProfileService(profileRepo, genderizeClient, agifyClient, natClient, cacheSvc)
 	authSvc := service.NewAuthService(userRepo, githubClient)
 
 	// ── Step 9: Handlers ──────────────────────────────────────────────────────
@@ -117,12 +136,10 @@ func NewRouter() http.Handler {
 	// ── Step 10: Router ───────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
-	// Global middleware (outermost first per spec)
-	// We only use Logger, Recoverer, StripSlashes globally.
-	// CORS is applied per route group to allow wildcard for auth and strict for API.
+	// Global middleware (all routes)
+	r.Use(middleware.APICors)
 	r.Use(middleware.Logger)
 	r.Use(chiMiddleware.Recoverer)
-	r.Use(chiMiddleware.StripSlashes)
 
 	// 404 / 405 handlers
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
@@ -132,42 +149,29 @@ func NewRouter() http.Handler {
 		response.Error(w, http.StatusNotFound, "route not found")
 	})
 
-	// ── Public auth routes (rate-limited per IP) ──────────────────────────────
-	r.Group(func(r chi.Router) {
-		r.Use(middleware.APICors) // Wildcard CORS for auth
-		r.Use(middleware.AuthRateLimit)
-		r.Get("/auth/github", authHdl.RedirectToGitHub)
-		r.Get("/auth/github/callback", authHdl.HandleCallback)
-	})
+	// Auth routes (public, rate-limited per IP)
+	r.With(middleware.AuthRateLimit).Get("/auth/github", authHdl.RedirectToGitHub)
+	r.With(middleware.AuthRateLimit).Get("/auth/github/callback", authHdl.HandleCallback)
+	r.With(middleware.AuthRateLimit).Post("/auth/refresh", authHdl.Refresh)
+	r.With(middleware.AuthRateLimit).Post("/auth/logout", authHdl.Logout)
 
-	// ── Token lifecycle — public (no JWT required) ────────────────────────────
-	r.Group(func(r chi.Router) {
-		r.Use(middleware.APICors) // Wildcard CORS for auth
-		r.Use(middleware.CSRF)
-		r.Post("/auth/refresh", authHdl.Refresh)
-		r.Post("/auth/logout", authHdl.Logout)
-	})
-
-	// ── Protected API routes ──────────────────────────────────────────────────
-	// Middleware chain: JWTAuth → APIVersion → (route-level) APIRateLimit → RBAC
+	// API routes (protected)
 	jwtAuth := middleware.JWTAuth(userRepo)
-
-	r.Route("/api/profiles", func(r chi.Router) {
-		r.Use(middleware.WebCors) // Requires credentials
-		r.Use(middleware.APIVersion)
+	r.Group(func(r chi.Router) {
 		r.Use(jwtAuth)
-		r.Use(middleware.CSRF)
+		r.Use(middleware.APIVersion)
 		r.Use(middleware.APIRateLimit)
 
-		// Analyst + Admin (read operations) — order matters: /search and /export before /{id}
-		r.Get("/search", profileHdl.Search)
-		r.Get("/export", profileHdl.Export)
-		r.Get("/", profileHdl.List)
-		r.Get("/{id}", profileHdl.Get)
+		r.Get("/api/users/me", authHdl.Me)
 
-		// Admin only
-		r.With(middleware.RequireRole("admin")).Post("/", profileHdl.Create)
-		r.With(middleware.RequireRole("admin")).Delete("/{id}", profileHdl.Delete)
+		r.Get("/api/profiles/search", profileHdl.Search)
+		r.Get("/api/profiles/export", profileHdl.Export)
+		r.Get("/api/profiles", profileHdl.List)
+		r.Get("/api/profiles/{id}", profileHdl.Get)
+
+		r.With(middleware.RequireRole("admin")).Post("/api/profiles", profileHdl.Create)
+		r.With(middleware.RequireRole("admin")).Post("/api/profiles/import", profileHdl.ImportCSV)
+		r.With(middleware.RequireRole("admin")).Delete("/api/profiles/{id}", profileHdl.Delete)
 	})
 
 	slog.Info("Step 10: HTTP Server / Router initialized")

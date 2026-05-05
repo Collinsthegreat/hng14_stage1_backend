@@ -31,6 +31,16 @@ func NewUserRepository(pool *pgxpool.Pool) UserRepository {
 
 // UpsertUser inserts or updates a user record keyed by github_id.
 func (r *userRepository) UpsertUser(ctx context.Context, u *model.User) error {
+	var userCount int
+	if err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&userCount); err != nil {
+		return fmt.Errorf("count users: %w", err)
+	}
+	if userCount == 0 {
+		u.Role = "admin"
+	} else {
+		u.Role = "analyst"
+	}
+
 	query := `
 		INSERT INTO users (id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)

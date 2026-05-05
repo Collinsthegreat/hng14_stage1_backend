@@ -10,3 +10,6 @@ var AddCountryNameSQL string
 
 //go:embed 003_create_users_tokens.sql
 var CreateUsersTokensSQL string
+
+//go:embed 004_performance_indexes.sql
+var PerformanceIndexesSQL string

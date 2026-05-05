@@ -28,3 +28,14 @@ type ProfileListItem struct {
 type CreateProfileRequest struct {
 	Name string `json:"name"`
 }
+
+type ProfileRow struct {
+	Name               string
+	Gender             string
+	GenderProbability  float64
+	Age                int
+	AgeGroup           string
+	CountryID          string
+	CountryName        string
+	CountryProbability float64
+}

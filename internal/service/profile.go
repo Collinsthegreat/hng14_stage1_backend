@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/client"
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/model"
 	"github.com/Collinsthegreat/hng14_stage1_backend/internal/repository"
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -30,6 +30,8 @@ type ProfileService interface {
 	GetProfile(ctx context.Context, id string) (*model.Profile, error)
 	ListProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, int, error)
 	ExportProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, error)
+	BatchInsert(ctx context.Context, rows []model.ProfileRow) (inserted, duplicates int, err error)
+	InvalidateProfileCache(ctx context.Context)
 	DeleteProfile(ctx context.Context, id string) error
 }
 
@@ -38,10 +40,16 @@ type profileService struct {
 	genderize   client.GenderizeClient
 	agify       client.AgifyClient
 	nationalize client.NationalizeClient
+	cache       *CacheService
 }
 
-func NewProfileService(repo repository.ProfileRepository, genderize client.GenderizeClient, agify client.AgifyClient, nat client.NationalizeClient) ProfileService {
-	return &profileService{repo: repo, genderize: genderize, agify: agify, nationalize: nat}
+func NewProfileService(repo repository.ProfileRepository, genderize client.GenderizeClient, agify client.AgifyClient, nat client.NationalizeClient, cache *CacheService) ProfileService {
+	return &profileService{repo: repo, genderize: genderize, agify: agify, nationalize: nat, cache: cache}
+}
+
+type profileListCacheEntry struct {
+	Profiles []model.Profile `json:"profiles"`
+	Total    int             `json:"total"`
 }
 
 var nameRegex = regexp.MustCompile(`^[a-zA-Z\-]+$`)
@@ -124,6 +132,8 @@ func (s *profileService) CreateProfile(ctx context.Context, req model.CreateProf
 		return nil, false, fmt.Errorf("db error: %w", err)
 	}
 
+	go s.InvalidateProfileCache(context.Background())
+
 	return p, false, nil
 }
 
@@ -132,16 +142,58 @@ func (s *profileService) GetProfile(ctx context.Context, id string) (*model.Prof
 }
 
 func (s *profileService) ListProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, int, error) {
-	return s.repo.List(ctx, f)
+	f = NormalizeFilter(f)
+	key := CacheKey(f)
+
+	var cached profileListCacheEntry
+	if s.cache != nil {
+		if err := s.cache.Get(ctx, key, &cached); err == nil {
+			if cached.Profiles == nil {
+				cached.Profiles = make([]model.Profile, 0)
+			}
+			return cached.Profiles, cached.Total, nil
+		}
+	}
+
+	profiles, total, err := s.repo.List(ctx, f)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if s.cache != nil {
+		_ = s.cache.Set(ctx, key, profileListCacheEntry{
+			Profiles: profiles,
+			Total:    total,
+		}, 60*time.Second)
+	}
+
+	if profiles == nil {
+		profiles = make([]model.Profile, 0)
+	}
+	return profiles, total, nil
 }
 
 func (s *profileService) ExportProfiles(ctx context.Context, f repository.ProfileFilter) ([]model.Profile, error) {
+	f = NormalizeFilter(f)
 	return s.repo.ListAll(ctx, f)
 }
 
+func (s *profileService) BatchInsert(ctx context.Context, rows []model.ProfileRow) (inserted, duplicates int, err error) {
+	return s.repo.BatchInsert(ctx, rows)
+}
+
+func (s *profileService) InvalidateProfileCache(ctx context.Context) {
+	if s.cache != nil {
+		s.cache.InvalidateProfileCache(ctx)
+	}
+}
 
 func (s *profileService) DeleteProfile(ctx context.Context, id string) error {
-	return s.repo.Delete(ctx, id)
+	if err := s.repo.Delete(ctx, id); err != nil {
+		return err
+	}
+	go s.InvalidateProfileCache(context.Background())
+	return nil
 }
 
 func classifyAgeGroup(age int) string {
